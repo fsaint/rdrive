@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+venv/
+.venv/
+
+# rdrive database
+.rdrive.db
+.rdrive.db-journal
+
+# Credentials (never commit these!)
+token.json
+client_secrets.json
+
+# OS files
+.DS_Store
+Thumbs.db
