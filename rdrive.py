@@ -7,6 +7,7 @@ a local directory and Google Drive.
 """
 
 import argparse
+import logging
 import re
 import sys
 import time
@@ -14,6 +15,12 @@ from datetime import datetime
 from pathlib import Path
 
 from drive_client import DriveClient
+
+# Configure logging
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(levelname)s: %(message)s'
+)
 from sync_state import SyncStateDB
 from sync_engine import SyncEngine
 
@@ -115,6 +122,10 @@ def cmd_init(args):
 
 def cmd_sync(args):
     """Perform synchronization."""
+    # Enable verbose logging if requested
+    if args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+
     sync_root = find_sync_root()
     if not sync_root:
         print("Error: Not in a sync directory. Run 'rdrive init' first.")
@@ -130,7 +141,7 @@ def cmd_sync(args):
         return 1
 
     # Authenticate
-    drive = DriveClient()
+    drive = DriveClient(continue_on_error=args.continue_on_error)
     if not drive.authenticate():
         db.close()
         return 1
@@ -144,6 +155,23 @@ def cmd_sync(args):
     print("Scanning remote files...")
     remote_files = engine.scan_remote(folder_id)
     print(f"  Found {len(remote_files)} remote files")
+
+    # Report skipped directories
+    if drive.skipped_dirs:
+        print(f"  Skipped {len(drive.skipped_dirs)} ignored directories")
+        if args.verbose:
+            for d in drive.skipped_dirs[:10]:  # Show first 10
+                print(f"    - {d}/")
+            if len(drive.skipped_dirs) > 10:
+                print(f"    ... and {len(drive.skipped_dirs) - 10} more")
+
+    # Report any errors during remote scanning
+    if drive.errors:
+        print(f"  Warning: {len(drive.errors)} folder(s) could not be scanned:")
+        for error in drive.errors:
+            print(f"    - {error['path']} (HTTP {error['status']})")
+        if not args.continue_on_error:
+            print("  Use --continue-on-error to skip problematic folders.")
 
     print("Computing sync actions...")
     actions = engine.compute_actions(local_files, remote_files)
@@ -306,6 +334,10 @@ def cmd_recent(args):
 
 def cmd_status(args):
     """Show sync status without making changes."""
+    # Enable verbose logging if requested
+    if args.verbose:
+        logging.getLogger().setLevel(logging.INFO)
+
     sync_root = find_sync_root()
     if not sync_root:
         print("Error: Not in a sync directory. Run 'rdrive init' first.")
@@ -321,7 +353,7 @@ def cmd_status(args):
         return 1
 
     # Authenticate
-    drive = DriveClient()
+    drive = DriveClient(continue_on_error=args.continue_on_error)
     if not drive.authenticate():
         db.close()
         return 1
@@ -333,6 +365,17 @@ def cmd_status(args):
 
     print("Scanning remote files...")
     remote_files = engine.scan_remote(folder_id)
+    print(f"  Found {len(remote_files)} remote files")
+
+    # Report skipped directories
+    if drive.skipped_dirs:
+        print(f"  Skipped {len(drive.skipped_dirs)} ignored directories")
+
+    # Report any errors during remote scanning
+    if drive.errors:
+        print(f"  Warning: {len(drive.errors)} folder(s) could not be scanned:")
+        for error in drive.errors:
+            print(f"    - {error['path']} (HTTP {error['status']})")
 
     status = engine.get_status(local_files, remote_files)
     db.close()
@@ -414,10 +457,30 @@ def main():
         action='store_true',
         help='Show what would be synced without making any changes'
     )
+    sync_parser.add_argument(
+        '--continue-on-error', '-c',
+        action='store_true',
+        help='Continue scanning even if some folders fail (e.g., API errors)'
+    )
+    sync_parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Show detailed progress including retry attempts'
+    )
     sync_parser.set_defaults(func=cmd_sync)
 
     # status command
     status_parser = subparsers.add_parser('status', help='Show sync status')
+    status_parser.add_argument(
+        '--continue-on-error', '-c',
+        action='store_true',
+        help='Continue scanning even if some folders fail (e.g., API errors)'
+    )
+    status_parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Show detailed progress including retry attempts'
+    )
     status_parser.set_defaults(func=cmd_status)
 
     # recent command

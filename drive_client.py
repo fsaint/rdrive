@@ -2,10 +2,15 @@
 
 import os
 import json
+import time
+import logging
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
 from google.oauth2.credentials import Credentials
+from googleapiclient.errors import HttpError
+
+logger = logging.getLogger(__name__)
 from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -24,9 +29,15 @@ CLIENT_SECRETS_PATH = CREDENTIALS_DIR / 'client_secrets.json'
 class DriveClient:
     """Google Drive API client with OAuth authentication."""
 
-    def __init__(self):
+    # Retry settings
+    MAX_RETRIES = 3
+    RETRY_DELAY = 1  # seconds, will be exponentially increased
+
+    def __init__(self, continue_on_error: bool = False):
         self.service = None
         self.credentials = None
+        self.continue_on_error = continue_on_error
+        self.errors: List[Dict] = []  # Track errors during operations
 
     def authenticate(self) -> bool:
         """
@@ -78,52 +89,104 @@ class DriveClient:
         """Check if client is authenticated."""
         return self.service is not None
 
-    def list_files(self, folder_id: str, recursive: bool = True) -> Dict[str, Dict]:
+    def list_files(self, folder_id: str, recursive: bool = True,
+                    should_skip: callable = None) -> Dict[str, Dict]:
         """
         List files in a folder, optionally recursively.
         Returns dict mapping relative paths to file metadata.
+
+        Args:
+            should_skip: Optional callable(path) -> bool to skip directories/files.
         """
+        self.errors = []  # Reset errors for this operation
+        self.skipped_dirs: List[str] = []  # Track skipped directories
         files = {}
-        self._list_files_recursive(folder_id, '', files, recursive)
+        self._list_files_recursive(folder_id, '', files, recursive, should_skip)
         return files
 
+    def _execute_with_retry(self, request, operation_desc: str = "API call"):
+        """Execute a Drive API request with retry logic for transient errors."""
+        last_error = None
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                return request.execute()
+            except HttpError as e:
+                last_error = e
+                # Retry on server errors (5xx) and rate limiting (403, 429)
+                if e.resp.status in (500, 502, 503, 504, 403, 429):
+                    delay = self.RETRY_DELAY * (2 ** attempt)
+                    logger.warning(
+                        f"{operation_desc} failed (attempt {attempt + 1}/{self.MAX_RETRIES}): "
+                        f"HTTP {e.resp.status}. Retrying in {delay}s..."
+                    )
+                    time.sleep(delay)
+                else:
+                    raise  # Don't retry client errors
+        # All retries exhausted
+        raise last_error
+
     def _list_files_recursive(self, folder_id: str, path_prefix: str,
-                               files: Dict, recursive: bool):
+                               files: Dict, recursive: bool,
+                               should_skip: callable = None):
         """Recursively list files."""
         query = f"'{folder_id}' in parents and trashed = false"
         page_token = None
 
-        while True:
-            response = self.service.files().list(
-                q=query,
-                spaces='drive',
-                fields='nextPageToken, files(id, name, mimeType, md5Checksum, modifiedTime)',
-                pageToken=page_token,
-                supportsAllDrives=True,
-                includeItemsFromAllDrives=True
-            ).execute()
+        try:
+            while True:
+                request = self.service.files().list(
+                    q=query,
+                    spaces='drive',
+                    fields='nextPageToken, files(id, name, mimeType, md5Checksum, modifiedTime)',
+                    pageToken=page_token,
+                    supportsAllDrives=True,
+                    includeItemsFromAllDrives=True
+                )
+                response = self._execute_with_retry(
+                    request, f"Listing folder '{path_prefix or 'root'}'"
+                )
 
-            for item in response.get('files', []):
-                name = item['name']
-                rel_path = f"{path_prefix}{name}" if path_prefix else name
+                for item in response.get('files', []):
+                    name = item['name']
+                    rel_path = f"{path_prefix}{name}" if path_prefix else name
 
-                if item['mimeType'] == 'application/vnd.google-apps.folder':
-                    if recursive:
-                        self._list_files_recursive(
-                            item['id'], f"{rel_path}/", files, recursive
-                        )
-                else:
-                    files[rel_path] = {
-                        'id': item['id'],
-                        'name': item['name'],
-                        'md5': item.get('md5Checksum'),
-                        'modified': item.get('modifiedTime'),
-                        'mimeType': item['mimeType']
-                    }
+                    # Check if this path should be skipped
+                    if should_skip and should_skip(rel_path):
+                        if item['mimeType'] == 'application/vnd.google-apps.folder':
+                            self.skipped_dirs.append(rel_path)
+                            logger.info(f"Skipping ignored directory: {rel_path}")
+                        continue
 
-            page_token = response.get('nextPageToken')
-            if not page_token:
-                break
+                    if item['mimeType'] == 'application/vnd.google-apps.folder':
+                        if recursive:
+                            self._list_files_recursive(
+                                item['id'], f"{rel_path}/", files, recursive, should_skip
+                            )
+                    else:
+                        files[rel_path] = {
+                            'id': item['id'],
+                            'name': item['name'],
+                            'md5': item.get('md5Checksum'),
+                            'modified': item.get('modifiedTime'),
+                            'mimeType': item['mimeType']
+                        }
+
+                page_token = response.get('nextPageToken')
+                if not page_token:
+                    break
+
+        except HttpError as e:
+            error_info = {
+                'path': path_prefix or '/',
+                'folder_id': folder_id,
+                'error': str(e),
+                'status': e.resp.status
+            }
+            self.errors.append(error_info)
+            logger.error(f"Error scanning '{path_prefix or '/'}': {e}")
+
+            if not self.continue_on_error:
+                raise
 
     def get_or_create_folder(self, name: str, parent_id: Optional[str] = None) -> str:
         """Get or create a folder by name. Returns folder ID."""

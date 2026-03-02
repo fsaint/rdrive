@@ -1,13 +1,16 @@
 """Core sync logic for rdrive."""
 
+import fnmatch
 import hashlib
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, NamedTuple
+from typing import Dict, List, Optional, Set, Tuple, NamedTuple
 from enum import Enum, auto
 
 from sync_state import SyncStateDB, FileState
 from drive_client import DriveClient
+
+RDRIVEIGNORE_FILE = '.rdriveignore'
 
 
 class Action(Enum):
@@ -34,19 +37,55 @@ class SyncAction(NamedTuple):
 class SyncEngine:
     """Handles the sync logic between local filesystem and Google Drive."""
 
-    IGNORED_PATTERNS = {'.rdrive.db', '.rdrive.db-journal', '.DS_Store', '.git'}
+    # Always ignored (internal files)
+    BUILTIN_IGNORED = {'.rdrive.db', '.rdrive.db-journal', '.DS_Store', '.git', RDRIVEIGNORE_FILE}
 
     def __init__(self, sync_root: Path, db: SyncStateDB, drive: DriveClient):
         self.sync_root = sync_root
         self.db = db
         self.drive = drive
+        self.ignore_patterns: List[str] = []
+        self._load_ignore_patterns()
+
+    def _load_ignore_patterns(self):
+        """Load ignore patterns from .rdriveignore file."""
+        ignore_file = self.sync_root / RDRIVEIGNORE_FILE
+        if ignore_file.exists():
+            with open(ignore_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if line and not line.startswith('#'):
+                        self.ignore_patterns.append(line)
 
     def _should_ignore(self, path: str) -> bool:
         """Check if a path should be ignored."""
         parts = Path(path).parts
+
+        # Check built-in patterns (exact match on any path component)
         for part in parts:
-            if part in self.IGNORED_PATTERNS or part.startswith('.'):
+            if part in self.BUILTIN_IGNORED:
                 return True
+
+        # Check user-defined patterns from .rdriveignore
+        for pattern in self.ignore_patterns:
+            # Pattern ending with / matches directories (any path component)
+            if pattern.endswith('/'):
+                dir_pattern = pattern.rstrip('/')
+                if any(fnmatch.fnmatch(part, dir_pattern) for part in parts):
+                    return True
+            # Pattern with / matches full path
+            elif '/' in pattern:
+                if fnmatch.fnmatch(path, pattern):
+                    return True
+            # Pattern without / matches any path component or filename
+            else:
+                if any(fnmatch.fnmatch(part, pattern) for part in parts):
+                    return True
+                # Also match against full path for patterns like *.log
+                if fnmatch.fnmatch(path, pattern):
+                    return True
+
         return False
 
     def compute_md5(self, file_path: Path) -> str:
@@ -78,7 +117,7 @@ class SyncEngine:
         Scan remote Drive folder for all files.
         Returns dict mapping relative paths to file info.
         """
-        return self.drive.list_files(folder_id)
+        return self.drive.list_files(folder_id, should_skip=self._should_ignore)
 
     def compute_actions(self, local_files: Dict, remote_files: Dict) -> List[SyncAction]:
         """
