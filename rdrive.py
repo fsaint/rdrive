@@ -173,16 +173,26 @@ def cmd_sync(args):
         if not args.continue_on_error:
             print("  Use --continue-on-error to skip problematic folders.")
 
+    print("Scanning directories...")
+    local_dirs = engine.scan_local_dirs()
+    remote_dirs = set(drive.found_dirs)  # Collected during scan_remote above
+    dir_actions = engine.compute_dir_actions(local_dirs, remote_dirs)
+
     print("Computing sync actions...")
     actions = engine.compute_actions(local_files, remote_files)
 
-    if not actions:
+    if not actions and not dir_actions:
         print("Everything is in sync!")
         db.close()
         return 0
 
+    # Prepend directory creation actions so folders exist before file uploads
+    actions = dir_actions + actions
+
     # Summarize actions
     from sync_engine import Action
+    create_remote_dir_count = sum(1 for a in actions if a.action == Action.CREATE_REMOTE_DIR)
+    create_local_dir_count = sum(1 for a in actions if a.action == Action.CREATE_LOCAL_DIR)
     upload_count = sum(1 for a in actions if a.action == Action.UPLOAD)
     download_count = sum(1 for a in actions if a.action == Action.DOWNLOAD)
     delete_local_count = sum(1 for a in actions if a.action == Action.DELETE_LOCAL)
@@ -190,6 +200,10 @@ def cmd_sync(args):
     conflict_count = sum(1 for a in actions if a.action == Action.CONFLICT)
 
     print(f"\nPending actions:")
+    if create_local_dir_count:
+        print(f"  Create local dirs: {create_local_dir_count}")
+    if create_remote_dir_count:
+        print(f"  Create remote dirs: {create_remote_dir_count}")
     if upload_count:
         print(f"  Upload: {upload_count} files")
     if download_count:
@@ -205,7 +219,11 @@ def cmd_sync(args):
     if args.dry_run:
         print("\n[Dry run] The following changes would be made:\n")
         for a in actions:
-            if a.action == Action.UPLOAD:
+            if a.action == Action.CREATE_LOCAL_DIR:
+                print(f"  + CREATE LOCAL DIR:  {a.path}/")
+            elif a.action == Action.CREATE_REMOTE_DIR:
+                print(f"  + CREATE REMOTE DIR: {a.path}/")
+            elif a.action == Action.UPLOAD:
                 print(f"  + UPLOAD:        {a.path}")
             elif a.action == Action.DOWNLOAD:
                 print(f"  ↓ DOWNLOAD:      {a.path}")

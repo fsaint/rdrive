@@ -38,6 +38,7 @@ class DriveClient:
         self.credentials = None
         self.continue_on_error = continue_on_error
         self.errors: List[Dict] = []  # Track errors during operations
+        self.found_dirs: List[str] = []  # Track directories found during listing
 
     def authenticate(self) -> bool:
         """
@@ -100,6 +101,7 @@ class DriveClient:
         """
         self.errors = []  # Reset errors for this operation
         self.skipped_dirs: List[str] = []  # Track skipped directories
+        self.found_dirs = []  # Track directories found during listing
         files = {}
         self._list_files_recursive(folder_id, '', files, recursive, should_skip)
         return files
@@ -158,6 +160,7 @@ class DriveClient:
                         continue
 
                     if item['mimeType'] == 'application/vnd.google-apps.folder':
+                        self.found_dirs.append(rel_path)
                         if recursive:
                             self._list_files_recursive(
                                 item['id'], f"{rel_path}/", files, recursive, should_skip

@@ -21,6 +21,8 @@ class Action(Enum):
     DELETE_REMOTE = auto()
     CONFLICT = auto()
     REMOVE_TRACKING = auto()
+    CREATE_REMOTE_DIR = auto()
+    CREATE_LOCAL_DIR = auto()
     NONE = auto()
 
 
@@ -112,12 +114,44 @@ class SyncEngine:
                     }
         return files
 
+    def scan_local_dirs(self) -> Set[str]:
+        """
+        Scan local directory for all subdirectories.
+        Returns set of relative directory paths.
+        """
+        dirs = set()
+        for dir_path in self.sync_root.rglob('*'):
+            if dir_path.is_dir():
+                rel_path = str(dir_path.relative_to(self.sync_root))
+                if not self._should_ignore(rel_path):
+                    dirs.add(rel_path)
+        return dirs
+
     def scan_remote(self, folder_id: str) -> Dict[str, Dict]:
         """
         Scan remote Drive folder for all files.
         Returns dict mapping relative paths to file info.
         """
         return self.drive.list_files(folder_id, should_skip=self._should_ignore)
+
+    def compute_dir_actions(self, local_dirs: Set[str], remote_dirs: Set[str]) -> List[SyncAction]:
+        """Compute actions needed to sync directory structure both ways."""
+        actions = []
+        # Remote dirs missing locally -> create local
+        missing_local = remote_dirs - local_dirs
+        for dir_path in sorted(missing_local):
+            actions.append(SyncAction(
+                Action.CREATE_LOCAL_DIR, dir_path,
+                self.sync_root / dir_path, None, None, None
+            ))
+        # Local dirs missing remotely -> create remote
+        missing_remote = local_dirs - remote_dirs
+        for dir_path in sorted(missing_remote):
+            actions.append(SyncAction(
+                Action.CREATE_REMOTE_DIR, dir_path,
+                self.sync_root / dir_path, None, None, None
+            ))
+        return actions
 
     def compute_actions(self, local_files: Dict, remote_files: Dict) -> List[SyncAction]:
         """
@@ -290,6 +324,19 @@ class SyncEngine:
             elif action.action == Action.REMOVE_TRACKING:
                 print(f"  Removing tracking: {action.path}")
                 self.db.remove_state(action.path)
+
+            elif action.action == Action.CREATE_REMOTE_DIR:
+                print(f"  Creating remote directory: {action.path}")
+                parts = Path(action.path).parts
+                current_parent = root_folder_id
+                for folder_name in parts:
+                    current_parent = self.drive.get_or_create_folder(
+                        folder_name, current_parent
+                    )
+
+            elif action.action == Action.CREATE_LOCAL_DIR:
+                print(f"  Creating local directory: {action.path}")
+                action.local_path.mkdir(parents=True, exist_ok=True)
 
             return True
 
